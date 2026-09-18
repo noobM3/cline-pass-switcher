@@ -43,9 +43,16 @@ Model:    cline-pass/glm-5.2 等
 
 ---
 
-## Docker 部署
+## Docker 与 Dokploy 部署
 
-### 方式 A：All-in-one（自带 Caddy 自动 HTTPS，推荐新手）
+### 方式 A：Dokploy 一键部署（纯环境变量驱动，免挂载卷）
+
+本项目已全面适配 **Dokploy** PaaS 平台并支持 **GitHub Actions 自动化 CI/CD**：
+- **纯环境变量驱动（Stateless）**：账号池（支持逗号分隔多个 Key）、访问密钥、轮询模式等全部通过环境变量注入，**无需挂载任何存储卷 (Volumes)**，容器任意销毁重建依然稳定运行。
+- **GitHub Actions + Webhook 自动部署**：代码 push 到 GitHub 后自动构建双架构镜像（amd64/arm64）推送到 ghcr.io，并触发 Dokploy Webhook 自动更新上线。
+- 详细图文操作步骤请参考：👉 **[Dokploy 自动化部署指南](docs/dokploy-deployment.md)**。
+
+### 方式 B：All-in-one（自带 Caddy 自动 HTTPS）
 
 ```bash
 mkdir -p data && cp config.example.json data/config.json

@@ -61,8 +61,22 @@ function loadJson(file, fallback) {
 }
 const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
 const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
-const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
+const saveConfig = () => {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  } catch (err) {
+    console.warn('[config] 写入磁盘失败（无持久卷环境属正常，内存配置生效中）:', err.message);
+  }
+};
+const saveMeta = () => {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
+  } catch (err) {
+    // 内存中缓存正常，忽略写入错误
+  }
+};
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
@@ -85,13 +99,51 @@ config.accountMode = config.accountMode === 'roundrobin' ? 'roundrobin' : 'singl
   if (dirty) saveConfig();
 })();
 
-// 环境变量覆盖（便于 Docker 部署）。注意：此后若通过控制台保存设置，当前生效值会写回 config.json
-if (process.env.CLINE_PASS_KEY) {
-  const k = process.env.CLINE_PASS_KEY.trim();
-  if (k && !(config.accounts || []).some((a) => a.key === k)) {
-    config.accounts = [{ name: 'env-account', key: k, enabled: true }, ...(config.accounts || [])];
+// 环境变量覆盖（支持完全免挂载持久卷的无状态部署）
+// 1. 支持直接注入完整 JSON 配置（含账号、钉住策略等）
+if (process.env.CLINE_PASS_CONFIG) {
+  try {
+    const customConfig = JSON.parse(process.env.CLINE_PASS_CONFIG.trim());
+    if (customConfig && typeof customConfig === 'object') {
+      Object.assign(config, customConfig);
+    }
+  } catch (err) {
+    console.warn('[config] 解析 CLINE_PASS_CONFIG 失败:', err.message);
   }
 }
+
+// 2. 支持单个 Key 或逗号/换行分隔的多个 Key（自动注入账号池）
+const rawKeys = process.env.CLINE_PASS_KEYS || process.env.CLINE_PASS_KEY;
+if (rawKeys) {
+  const keys = rawKeys.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+  if (keys.length > 0) {
+    if (!Array.isArray(config.accounts)) config.accounts = [];
+    keys.forEach((k, idx) => {
+      if (!config.accounts.some((a) => a.key === k)) {
+        config.accounts.push({ name: `env-account-${idx + 1}`, key: k, enabled: true });
+      }
+    });
+  }
+}
+
+// 3. 账号模式：single (手动指定) 或 roundrobin (轮询)
+if (process.env.ACCOUNT_MODE) {
+  const mode = process.env.ACCOUNT_MODE.trim().toLowerCase();
+  if (['single', 'roundrobin'].includes(mode)) {
+    config.accountMode = mode;
+  }
+}
+
+// 4. 目录模型暴露开关
+if (process.env.EXPOSE_CATALOG !== undefined) {
+  config.exposeCatalog = ['true', '1', 'yes'].includes(process.env.EXPOSE_CATALOG.trim().toLowerCase());
+}
+
+// 5. 自定义上游接口地址
+if (process.env.UPSTREAM_BASE && process.env.UPSTREAM_BASE.trim()) {
+  config.upstreamBase = process.env.UPSTREAM_BASE.trim();
+}
+
 if (process.env.PROXY_KEY && process.env.PROXY_KEY.trim()) config.proxyKey = process.env.PROXY_KEY.trim();
 if (process.env.PUBLIC_BASE_URL) config.publicBaseUrl = process.env.PUBLIC_BASE_URL.trim();
 if (process.env.PORT) config.port = Number(process.env.PORT) || config.port;
@@ -767,6 +819,9 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
   try {
+    if (req.method === 'GET' && (p === '/health' || p === '/ping')) {
+      return sendJSON(res, 200, { status: 'ok', uptime: process.uptime() });
+    }
     if (req.method === 'GET' && p === '/api/meta') {
       return sendJSON(res, 200, { authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), configured: isConfigured() });
     }

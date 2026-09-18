@@ -1,0 +1,38 @@
+# Dokploy Compose 一键部署模板（免挂载持久卷，纯环境变量驱动）
+# 在 Dokploy 控制台 -> 选择项目 -> Create Service -> Compose -> 粘贴此配置即可
+services:
+  cline-pass-switcher:
+    # 方式 A（推荐配合 GitHub Actions）：直接拉取由 GitHub Actions 构建推送的最新多架构镜像
+    # 请将 <your-github-username> 替换为你的 GitHub 账号/组织名（全小写）
+    # image: ghcr.io/<your-github-username>/cline-pass-switcher:latest
+
+    # 方式 B：从当前仓库源码构建
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cline-pass-switcher:latest
+
+    container_name: cline-pass-switcher
+    restart: unless-stopped
+    environment:
+      - BIND_HOST=0.0.0.0
+      - PORT=3123
+      # 必填：你的 Cline Pass Key（支持逗号分隔填入多个 Key 实现轮询）
+      - CLINE_PASS_KEY=${CLINE_PASS_KEY:-}
+      # 轮询模式：roundrobin（多 key 轮询）或 single（单账号）
+      - ACCOUNT_MODE=${ACCOUNT_MODE:-roundrobin}
+      # 强烈建议设置：控制台密码及 API Key，防止被未授权调用
+      - PROXY_KEY=${PROXY_KEY:-}
+      # 绑定的公网地址
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    expose:
+      - "3123"
+    ports:
+      # 如果不走 Dokploy Traefik 代理，可直接映射到宿主机端口
+      - "3123:3123"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3123/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
