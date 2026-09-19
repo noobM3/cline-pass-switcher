@@ -33,6 +33,10 @@
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #243447; color: #9cc3ff; }
   .badge.green { background: #1d3a2a; color: var(--green); }
   .badge.orange { background: #3d2f1a; color: var(--orange); }
+  .badge.red { background: #3d1f1d; color: var(--red); }
+  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .head > div:first-child { flex: 1 1 420px; min-width: 0; }
+  .warmup { font-family: Consolas, monospace; font-size: 12.5px; padding: 6px 12px; border-radius: 8px; white-space: nowrap; cursor: default; flex: 0 0 auto; }
   select, input[type=number] { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; max-width: 200px; }
   input[type=number] { width: 64px; }
   .row-actions { display: flex; gap: 6px; }
@@ -95,8 +99,13 @@
     </div>
   </div>
 
-  <h1>Cline Pass 上游控制台</h1>
-  <div class="sub">本地代理 + 观测面板 —— 枚举订阅模型背后的上游，多上游按优先级自动故障转移，支持精确钉住 / 优先回退 / 排除上游 / 成本·首字·吞吐排序</div>
+  <div class="head">
+    <div>
+      <h1>Cline Pass 上游控制台</h1>
+      <div class="sub">本地代理 + 观测面板 —— 枚举订阅模型背后的上游，多上游按优先级自动故障转移，支持精确钉住 / 优先回退 / 排除上游 / 成本·首字·吞吐排序</div>
+    </div>
+    <div id="warmupBadge" class="badge warmup" style="display:none"></div>
+  </div>
 
   <div id="noKeyBanner" class="banner" style="display:none; border-left-color: var(--red);">
     <b>尚未配置上游 API Key：</b>在下方「账号管理」添加你的 Cline Pass 账号（sk_ 开头的 key）并保存即可开始使用；也可通过 config.json 的 accounts 或环境变量 CLINE_PASS_KEY 提供。
@@ -381,8 +390,61 @@ async function loadAll() {
   render();
   renderAccounts();
   renderSecurity(sec);
+  renderWarmup(models.warmup);
   $('#noKeyBanner').style.display = meta.configured ? 'none' : 'block';
 }
+
+// 右上角：额度唤醒状态（按唤醒时区判断「今天」是否已成功发出）
+function warmupTodayAt(w, now = Date.now()) {
+  const [hh, mm] = String(w.time || '06:00').split(':').map(Number);
+  const off = (Number(w.tzOffset) || 0) * 3600e3;
+  const local = new Date(now + off);
+  return Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), hh, mm, 0, 0) - off;
+}
+
+function renderWarmup(w) {
+  const el = $('#warmupBadge');
+  if (!w) { el.style.display = 'none'; return; }
+  el.style.display = 'inline-flex';
+  if (!w.enabled) {
+    el.className = 'badge warmup orange';
+    el.textContent = '额度唤醒：已关闭';
+    el.title = '设置环境变量 WARMUP_ENABLED=true 后，每天会在固定时刻自动发一条小请求触发额度窗口';
+    return;
+  }
+  const tz = `UTC${w.tzOffset >= 0 ? '+' : ''}${w.tzOffset}`;
+  const base = `额度唤醒 ${w.time}（${tz}）`;
+  const now = Date.now();
+  const today = warmupTodayAt(w, now);
+  const nextTip = `下次唤醒：${new Date(w.nextAt || (now < today ? today : today + 86400e3)).toLocaleString()}`;
+  if (now < today) {
+    el.className = 'badge warmup';
+    el.textContent = `${base} · 今日待触发`;
+    el.title = `${nextTip}\n模型：${w.model}`;
+    return;
+  }
+  if ((w.lastRunAt || 0) < today) {
+    el.className = 'badge warmup orange';
+    el.textContent = `${base} · 今日未触发`;
+    el.title = `今天 ${w.time} 没有发出唤醒请求（当时服务可能未运行，且已超出补发宽限期 ${w.catchupMinutes} 分钟）。\n${nextTip}`;
+    return;
+  }
+  const at = new Date(w.lastRunAt).toLocaleTimeString();
+  if (w.lastOk) {
+    el.className = 'badge warmup green';
+    el.textContent = `${base} ✔ 唤醒成功 ${at}`;
+    el.title = `今日唤醒成功：${new Date(w.lastRunAt).toLocaleString()}\n触发方式：${w.lastReason === 'catchup' ? '重启补发' : '定时触发'}\n模型：${w.model}${w.lastUpstream ? `\n实际命中上游：${w.lastUpstream}` : ''}\n耗时：${w.lastMs} ms\n${nextTip}`;
+  } else {
+    el.className = 'badge warmup red';
+    el.textContent = `${base} ✘ 唤醒失败 ${at}`;
+    el.title = `今日唤醒失败：${w.lastError || '未知错误'}\n模型：${w.model}（${w.lastMs} ms）\n${nextTip}`;
+  }
+}
+
+async function refreshWarmup() {
+  try { renderWarmup(await api('/api/warmup')); } catch { /* 网络/鉴权异常时保持上次显示 */ }
+}
+setInterval(() => { if (!document.hidden) refreshWarmup(); }, 60000);
 
 function renderSecurity(sec) {
   $('#secProxyKey').value = sec.proxyKey || '';

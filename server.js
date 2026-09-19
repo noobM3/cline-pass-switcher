@@ -148,6 +148,35 @@ if (process.env.PROXY_KEY && process.env.PROXY_KEY.trim()) config.proxyKey = pro
 if (process.env.PUBLIC_BASE_URL) config.publicBaseUrl = process.env.PUBLIC_BASE_URL.trim();
 if (process.env.PORT) config.port = Number(process.env.PORT) || config.port;
 
+// 6. 额度窗口唤醒：每天在固定时刻发一条 max_tokens=256 的真实小请求（链路同控制台「发送测试」），
+//    让上游从这一刻开始计算额度窗口；时刻按 WARMUP_TZ_OFFSET 指定的时区换算（默认 +8 = 北京时间）
+const WARMUP = {
+  enabled: true,
+  time: '06:00',
+  tzOffset: 8,
+  model: 'cline-pass/deepseek-v4.1-flash',
+  upstreams: [],           // 空 = 跟随该模型在控制台里的钉住配置
+  catchupMinutes: 120,     // 进程在时刻后才启动时的补发宽限期，0 = 不补发
+  timer: null,
+  nextAt: 0,
+};
+if (process.env.WARMUP_ENABLED !== undefined) {
+  WARMUP.enabled = ['true', '1', 'yes'].includes(process.env.WARMUP_ENABLED.trim().toLowerCase());
+}
+if (process.env.WARMUP_TIME && /^\d{1,2}:\d{2}$/.test(process.env.WARMUP_TIME.trim())) {
+  WARMUP.time = process.env.WARMUP_TIME.trim();
+}
+if (process.env.WARMUP_TZ_OFFSET && !Number.isNaN(Number(process.env.WARMUP_TZ_OFFSET))) {
+  WARMUP.tzOffset = Math.min(14, Math.max(-12, Number(process.env.WARMUP_TZ_OFFSET)));
+}
+if (process.env.WARMUP_MODEL && process.env.WARMUP_MODEL.trim()) WARMUP.model = process.env.WARMUP_MODEL.trim();
+if (process.env.WARMUP_UPSTREAM && process.env.WARMUP_UPSTREAM.trim()) {
+  WARMUP.upstreams = process.env.WARMUP_UPSTREAM.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+}
+if (process.env.WARMUP_CATCHUP_MINUTES !== undefined) {
+  WARMUP.catchupMinutes = Math.max(0, Number(process.env.WARMUP_CATCHUP_MINUTES) || 0);
+}
+
 function isConfigured() {
   return !!config.apiKey || enabledAccounts().length > 0;
 }
@@ -793,6 +822,39 @@ async function handleChat(req, res) {
   res.end(JSON.stringify(out));
 }
 
+// 控制台「发送测试」与定时唤醒共用：发一条 max_tokens=256 的真实请求，完整走故障转移链路。
+// 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值）；warmup=true 时失败也写入历史。
+async function testRequest(req, { model, upstream, upstreams, exclude, warmup = false } = {}) {
+  const t0 = Date.now();
+  const cfg = { ...(config.perModel[model] || {}) };
+  if (upstreams !== undefined) cfg.upstreams = upstreams;
+  else if (upstream !== undefined) cfg.upstreams = upstream ? [upstream] : [];
+  if (exclude !== undefined) cfg.exclude = exclude;
+  const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
+  const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
+  const trace = chain.trace || [];
+  const ms = Date.now() - t0;
+  const targets = (cfg.upstreams || []).filter(Boolean);
+  if (chain.status !== 200) {
+    const error = (chain.out?.error?.message || 'upstream error').slice?.(0, 400) || 'upstream error';
+    // 测试台的失败由前端即时呈现，无需入库；定时唤醒的失败要能在历史里追溯
+    if (warmup) record(model, { provider: null, canonical: null, ms, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error, account: chain.acc?.name || null, warmup: true });
+    return { ok: false, error, targets, exclude: cfg.exclude || [], trace };
+  }
+  const r = parseRouting(chain.out);
+  record(model, {
+    provider: r.finalProvider, canonical: r.canonicalSlug, ms, stream: false,
+    attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null,
+    ...(warmup ? { warmup: true } : {}),
+  });
+  return {
+    ok: true, ms, targets, exclude: cfg.exclude || [],
+    actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline, pinnable: r.pipeline !== null,
+    canonicalSlug: r.canonicalSlug, fallbacks: r.fallbacks, content: (r.content || '').slice(0, 120),
+    account: chain.acc?.name || null, trace,
+  };
+}
+
 // ---------- HTTP 服务 ----------
 function sendJSON(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
@@ -835,7 +897,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/models') {
       const cat = await catalog();
       const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
-      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null });
+      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null, warmup: warmupStatus() });
     }
     if (req.method === 'POST' && p === '/api/probe') {
       const { model } = await JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -847,29 +909,7 @@ const server = http.createServer(async (req, res) => {
       // 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值），完整走故障转移链路
       const { model, upstream, upstreams, exclude } = await JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: 'model required' });
-      const t0 = Date.now();
-      const cfg = { ...(config.perModel[model] || {}) };
-      if (upstreams !== undefined) cfg.upstreams = upstreams;
-      else if (upstream !== undefined) cfg.upstreams = upstream ? [upstream] : [];
-      if (exclude !== undefined) cfg.exclude = exclude;
-      const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
-      const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
-      const trace = chain.trace || [];
-      if (chain.status !== 200) {
-        return sendJSON(res, 200, {
-          ok: false, error: (chain.out?.error?.message || 'upstream error').slice?.(0, 400) || 'upstream error',
-          targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], trace,
-        });
-      }
-      const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
-      return sendJSON(res, 200, {
-        ok: true, ms: Date.now() - t0,
-        targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
-        actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline, pinnable: r.pipeline !== null,
-        canonicalSlug: r.canonicalSlug, fallbacks: r.fallbacks, content: (r.content || '').slice(0, 120),
-        account: chain.acc?.name || null, trace,
-      });
+      return sendJSON(res, 200, await testRequest(req, { model, upstream, upstreams, exclude }));
     }
     if (req.method === 'GET' && p === '/api/accounts') {
       return sendJSON(res, 200, {
@@ -943,6 +983,8 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true, ...r });
     }
     if (req.method === 'GET' && p === '/api/history') return sendJSON(res, 200, { history: META.history });
+    // 控制台右上角唤醒角标用（轻量，避免为刷新状态重拉 /api/models 的完整目录）
+    if (req.method === 'GET' && p === '/api/warmup') return sendJSON(res, 200, warmupStatus());
     if (req.method === 'GET' && p === '/api/config') return sendJSON(res, 200, { port: config.port, perModel: config.perModel, knownModels: config.knownModels });
     if (req.method === 'POST' && p === '/api/config') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -983,6 +1025,94 @@ const server = http.createServer(async (req, res) => {
 // HTTP 响应头只允许 Latin-1，账号名里的中文等字符需要清洗（历史/统计仍用原名）
 const headerSafe = (s) => String(s ?? '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 80) || '-';
 
+// ---------- 额度窗口唤醒（每日定时任务） ----------
+// 每个自然日在 WARMUP.time（WARMUP.tzOffset 时区）发一条真实小请求，让上游从这一刻起计算额度窗口。
+// 链路复用 testRequest（= 控制台「发送测试」），失败只记日志与历史，不影响服务。
+function warmupTodayAt(now = Date.now()) {
+  const [hh, mm] = WARMUP.time.split(':').map(Number);
+  const off = WARMUP.tzOffset * 3600e3;
+  const local = new Date(now + off);
+  return Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), hh, mm, 0, 0) - off;
+}
+// 下一次唤醒时刻：今天的已过则顺延到明天
+const warmupNextAt = (now = Date.now()) => {
+  const today = warmupTodayAt(now);
+  return today > now ? today : today + 86400e3;
+};
+// 重启补发：当天计划时刻已过但仍在宽限期内，且今天还没跑过
+function warmupCatchupDue(now = Date.now()) {
+  if (!WARMUP.catchupMinutes) return false;
+  const today = warmupTodayAt(now);
+  return now >= today && now - today <= WARMUP.catchupMinutes * 60000 && (META.warmup?.lastRunAt || 0) < today;
+}
+// runChatChain 只用 close 钩子在客户端断开时中止上游；定时任务没有客户端连接
+const internalReq = () => ({ on() {}, off() {} });
+
+function warmupStatus() {
+  if (!WARMUP.enabled) return { enabled: false };
+  return {
+    enabled: true, time: WARMUP.time, tzOffset: WARMUP.tzOffset, model: WARMUP.model,
+    upstreams: WARMUP.upstreams, catchupMinutes: WARMUP.catchupMinutes,
+    nextAt: WARMUP.nextAt || warmupNextAt(),
+    ...(META.warmup || {}),
+  };
+}
+
+async function warmupRun(reason) {
+  const t0 = Date.now();
+  let out;
+  try {
+    out = await testRequest(internalReq(), {
+      model: WARMUP.model,
+      ...(WARMUP.upstreams.length ? { upstreams: WARMUP.upstreams } : {}),
+      warmup: true,
+    });
+  } catch (err) {
+    out = { ok: false, error: err.message, trace: [] };
+  }
+  META.warmup = {
+    time: WARMUP.time, tzOffset: WARMUP.tzOffset, model: WARMUP.model, upstreams: WARMUP.upstreams,
+    lastRunAt: t0, lastOk: !!out.ok, lastMs: out.ms ?? Date.now() - t0, lastReason: reason,
+    lastUpstream: out.actual || null, lastError: out.ok ? null : String(out.error || 'unknown').slice(0, 300),
+  };
+  saveMeta();
+  console.log(out.ok
+    ? `[唤醒] ${WARMUP.model} 已发送（${reason}，${META.warmup.lastMs}ms，上游 ${META.warmup.lastUpstream || 'auto'}）`
+    : `[唤醒] ${WARMUP.model} 发送失败（${reason}）：${META.warmup.lastError}`);
+}
+
+function scheduleWarmup() {
+  if (WARMUP.timer) clearTimeout(WARMUP.timer);
+  WARMUP.timer = null;
+  if (!WARMUP.enabled) return;
+  const at = warmupNextAt();
+  WARMUP.nextAt = at;
+  WARMUP.timer = setTimeout(async () => {
+    WARMUP.timer = null;
+    await warmupRun('schedule');
+    scheduleWarmup();
+  }, Math.max(1000, at - Date.now()));
+  WARMUP.timer.unref?.();
+}
+
+function startWarmup() {
+  if (!WARMUP.enabled) {
+    console.log('[唤醒] 定时唤醒已关闭（WARMUP_ENABLED=false）');
+    return;
+  }
+  if (!isConfigured()) {
+    console.log('[唤醒] 未配置上游密钥，跳过定时唤醒');
+    return;
+  }
+  console.log(`[唤醒] 每日 ${WARMUP.time}（UTC${WARMUP.tzOffset >= 0 ? '+' : ''}${WARMUP.tzOffset}）发送一条 ${WARMUP.model}，下次 ${new Date(warmupNextAt()).toISOString()}`);
+  if (warmupCatchupDue()) {
+    console.log('[唤醒] 已过计划时刻但仍在补发宽限期内，启动后补发一次');
+    setTimeout(() => { warmupRun('catchup').then(scheduleWarmup); }, 5000).unref?.();
+  } else {
+    scheduleWarmup();
+  }
+}
+
 server.on('error', (e) => {
   console.error(`[错误] 端口 ${config.port} 监听失败（可能被占用）：${e.message}`);
   process.exit(1);
@@ -992,4 +1122,5 @@ const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 server.listen(config.port, BIND_HOST, () => {
   console.log(`Cline Pass 上游控制台:  http://127.0.0.1:${config.port}/`);
   console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1`);
+  startWarmup();
 });
